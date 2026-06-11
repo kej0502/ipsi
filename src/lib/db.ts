@@ -5,7 +5,11 @@ let _client: ReturnType<typeof neon> | null = null;
 
 function getClient() {
   if (!_client) {
-    _client = neon(process.env.DATABASE_URL!);
+    const url = process.env.DATABASE_URL;
+    if (!url) {
+      throw new Error('DATABASE_URL 환경변수가 설정되지 않았습니다.');
+    }
+    _client = neon(url);
   }
   return _client;
 }

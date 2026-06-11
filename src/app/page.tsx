@@ -49,7 +49,21 @@ async function getStats() {
 }
 
 export default async function HomePage() {
-  const stats = await getStats();
+  let stats;
+  try {
+    stats = await getStats();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4">
+        <div className="bg-red-50 border border-red-200 rounded-xl p-6 max-w-lg w-full">
+          <h2 className="font-bold text-red-700 mb-2">데이터베이스 연결 오류</h2>
+          <p className="text-sm text-red-600">{msg}</p>
+          <p className="text-xs text-gray-500 mt-3">Vercel 환경변수(DATABASE_URL)를 확인해주세요.</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-8">
