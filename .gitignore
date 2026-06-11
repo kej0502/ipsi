@@ -44,3 +44,5 @@ venv/
 
 # Playwright inspection scripts (dev only)
 crawler/inspect_*.js
+
+.vercel
