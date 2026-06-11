@@ -5,10 +5,12 @@ let _client: ReturnType<typeof neon> | null = null;
 
 function getClient() {
   if (!_client) {
-    const url = process.env.DATABASE_URL;
-    if (!url) {
+    const raw = process.env.DATABASE_URL;
+    if (!raw) {
       throw new Error('DATABASE_URL 환경변수가 설정되지 않았습니다.');
     }
+    // Strip UTF-8 BOM (U+FEFF) that Windows tooling sometimes prepends
+    const url = raw.replace(/^﻿/, '').trim();
     _client = neon(url);
   }
   return _client;
