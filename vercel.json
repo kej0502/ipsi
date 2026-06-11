@@ -1,0 +1,9 @@
+{
+  "buildCommand": "next build",
+  "outputDirectory": ".next",
+  "framework": "nextjs",
+  "env": {
+    "DATABASE_URL": "@database_url",
+    "GEMINI_API_KEY": "@gemini_api_key"
+  }
+}
