@@ -7,17 +7,22 @@
 
 import os
 import re
+import io
 import time
 import json
+import zlib
+import struct
+import zipfile
 import logging
+import tempfile
 from datetime import datetime, date
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 import psycopg2
 from psycopg2.extras import Json, execute_values
-import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env.local'))
@@ -26,7 +31,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ['DATABASE_URL']
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+OPENROUTER_MODEL = 'google/gemini-2.0-flash-exp:free'
+HF_EMBED_URL = (
+    'https://api-inference.huggingface.co/pipeline/feature-extraction/'
+    'sentence-transformers/paraphrase-multilingual-mpnet-base-v2'
+)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -34,6 +44,8 @@ HEADERS = {
     'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
     'Referer': 'https://www.megastudy.net/',
 }
+
+ATTACH_EXTS = {'.pdf', '.hwp', '.hwpx', '.xlsx', '.xls', '.docx', '.doc'}
 
 SOURCES = {
     'news': {
@@ -58,6 +70,183 @@ SOURCES = {
         'base_url': 'https://www.megastudy.net/entinfo/g_archive',
     },
 }
+
+
+# ── 첨부파일 처리 ─────────────────────────────────────────────
+
+def find_attachments(soup: BeautifulSoup, page_url: str) -> list[tuple[str, str]]:
+    """첨부파일 (url, filename) 목록 반환."""
+    seen: set[str] = set()
+    results: list[tuple[str, str]] = []
+
+    for a in soup.find_all('a', href=True):
+        href = a['href'].strip()
+        if not href or href.startswith('#'):
+            continue
+
+        link_text = a.get_text(strip=True)
+        href_path = urlparse(href).path.lower()
+        ext = os.path.splitext(href_path)[1]
+        text_ext = os.path.splitext(link_text.lower())[1] if link_text else ''
+
+        actual_ext = ext if ext in ATTACH_EXTS else (text_ext if text_ext in ATTACH_EXTS else None)
+        if actual_ext:
+            full_url = urljoin(page_url, href)
+            if full_url not in seen:
+                seen.add(full_url)
+                filename = link_text if text_ext in ATTACH_EXTS else (os.path.basename(href_path) or 'attachment')
+                results.append((full_url, filename))
+
+    # onclick 속성에 파일 경로가 있는 경우
+    for tag in soup.find_all(onclick=True):
+        onclick = tag['onclick']
+        m = re.search(r'["\']([^"\']+\.(hwp|hwpx|pdf|xlsx|xls|docx))["\']', onclick, re.IGNORECASE)
+        if m:
+            full_url = urljoin(page_url, m.group(1))
+            if full_url not in seen:
+                seen.add(full_url)
+                results.append((full_url, os.path.basename(m.group(1))))
+
+    return results
+
+
+def download_file(url: str) -> Optional[bytes]:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        if resp.status_code == 200:
+            return resp.content
+        log.warning(f"파일 다운로드 HTTP {resp.status_code}: {url}")
+    except Exception as e:
+        log.warning(f"파일 다운로드 실패 ({url}): {e}")
+    return None
+
+
+def _extract_pdf(data: bytes) -> str:
+    import pdfplumber
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        return '\n'.join(p.extract_text() or '' for p in pdf.pages)
+
+
+def _hwp_parse_records(data: bytes) -> str:
+    """HWP5 BodyText 레코드에서 텍스트 파싱."""
+    chars: list[str] = []
+    pos = 0
+    while pos + 4 <= len(data):
+        hdr = struct.unpack_from('<I', data, pos)[0]
+        rec_type = hdr & 0x3FF
+        size = (hdr >> 20) & 0xFFF
+        pos += 4
+        if size == 0xFFF:
+            if pos + 4 > len(data):
+                break
+            size = struct.unpack_from('<I', data, pos)[0]
+            pos += 4
+        rec = data[pos:pos + size]
+        pos += size
+        if rec_type == 67:  # HWPTAG_PARA_TEXT
+            for j in range(0, len(rec) - 1, 2):
+                c = struct.unpack_from('<H', rec, j)[0]
+                if c == 13:
+                    chars.append('\n')
+                elif c in (9, 32):
+                    chars.append(' ')
+                elif 0x20 <= c <= 0xFFFF:
+                    try:
+                        chars.append(chr(c))
+                    except Exception:
+                        pass
+    return ''.join(chars)
+
+
+def _extract_hwp(data: bytes) -> str:
+    """HWP5 (OLE 기반) 텍스트 추출."""
+    try:
+        import olefile
+        ole = olefile.OleFileIO(io.BytesIO(data))
+        texts: list[str] = []
+        for i in range(200):
+            stream = f'BodyText/Section{i:04d}'
+            if not ole.exists(stream):
+                break
+            raw = ole.openstream(stream).read()
+            try:
+                raw = zlib.decompress(raw, -15)
+            except zlib.error:
+                pass
+            texts.append(_hwp_parse_records(raw))
+        ole.close()
+        return '\n'.join(t for t in texts if t)
+    except Exception as e:
+        log.warning(f"HWP 파싱 실패: {e}")
+        return ''
+
+
+def _extract_hwpx(data: bytes) -> str:
+    """HWPX (ZIP 기반) 텍스트 추출."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            texts: list[str] = []
+            for name in sorted(zf.namelist()):
+                if 'section' in name.lower() and name.endswith('.xml'):
+                    content = zf.read(name).decode('utf-8', errors='ignore')
+                    text = re.sub(r'<[^>]+>', ' ', content)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    if text:
+                        texts.append(text)
+            return '\n'.join(texts)
+    except Exception as e:
+        log.warning(f"HWPX 파싱 실패: {e}")
+        return ''
+
+
+def _extract_excel(data: bytes) -> str:
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    rows: list[str] = []
+    for sheet in wb.worksheets:
+        for row in sheet.iter_rows(values_only=True):
+            row_str = '\t'.join(str(v) for v in row if v is not None)
+            if row_str.strip():
+                rows.append(row_str)
+    wb.close()
+    return '\n'.join(rows)
+
+
+def _extract_docx(data: bytes) -> str:
+    from docx import Document
+    doc = Document(io.BytesIO(data))
+    return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+def extract_attachment_text(data: bytes, filename: str) -> str:
+    ext = os.path.splitext(filename.lower())[1]
+    try:
+        if ext == '.pdf':
+            return _extract_pdf(data)
+        elif ext == '.hwp':
+            return _extract_hwp(data)
+        elif ext == '.hwpx':
+            return _extract_hwpx(data)
+        elif ext == '.xlsx':
+            return _extract_excel(data)
+        elif ext == '.docx':
+            return _extract_docx(data)
+        elif ext == '.xls':
+            try:
+                import xlrd
+                wb = xlrd.open_workbook(file_contents=data)
+                rows = []
+                for sheet in wb.sheets():
+                    for rx in range(sheet.nrows):
+                        row_str = '\t'.join(str(sheet.cell(rx, cx).value) for cx in range(sheet.ncols))
+                        if row_str.strip():
+                            rows.append(row_str)
+                return '\n'.join(rows)
+            except ImportError:
+                return ''
+    except Exception as e:
+        log.warning(f"첨부파일 텍스트 추출 실패 ({filename}): {e}")
+    return ''
 
 
 def get_db():
@@ -141,6 +330,20 @@ def parse_article(source_key: str, idx: int) -> Optional[dict]:
     if not title and not raw_content:
         return None
 
+    # 첨부파일 텍스트 추출
+    attachments = find_attachments(soup, url)
+    if attachments:
+        log.info(f"  첨부파일 {len(attachments)}개 발견")
+    for att_url, att_name in attachments[:5]:  # 최대 5개
+        file_data = download_file(att_url)
+        if not file_data:
+            continue
+        att_text = extract_attachment_text(file_data, att_name)
+        if att_text.strip():
+            raw_content += f'\n\n[첨부: {att_name}]\n{att_text[:6000]}'
+            log.info(f"  → 첨부파일 텍스트 {len(att_text)}자 추출: {att_name}")
+        time.sleep(0.5)
+
     return {
         'source': source_key,
         'title': title,
@@ -171,14 +374,14 @@ def save_article(conn, article: dict) -> Optional[int]:
         return row[0] if row else None
 
 
-# ── Gemini 분석 ────────────────────────────────────────────────
+# ── AI 분석 (OpenRouter) ───────────────────────────────────────
 
-def setup_gemini():
-    if not GEMINI_API_KEY:
-        log.warning("GEMINI_API_KEY 없음 - AI 분석 건너뜀")
+def setup_ai():
+    if not OPENROUTER_API_KEY:
+        log.warning("OPENROUTER_API_KEY 없음 - AI 분석 건너뜀")
         return None
-    genai.configure(api_key=GEMINI_API_KEY)
-    return genai.GenerativeModel('gemini-2.0-flash')
+    log.info(f"OpenRouter 준비 완료 (모델: {OPENROUTER_MODEL})")
+    return True  # 상태 플래그
 
 
 ANALYSIS_PROMPT = """아래는 한국 대학입시 관련 기사/자료입니다. 다음 항목을 JSON으로 추출해주세요.
@@ -201,28 +404,35 @@ ANALYSIS_PROMPT = """아래는 한국 대학입시 관련 기사/자료입니다
 ---"""
 
 
-def analyze_with_gemini(model, article: dict) -> Optional[dict]:
-    if not model:
+def analyze_with_ai(enabled, article: dict) -> Optional[dict]:
+    if not enabled or not OPENROUTER_API_KEY:
         return None
 
     content = f"제목: {article['title']}\n\n{article['raw_content']}"
-    content = content[:8000]  # 토큰 절약
+    content = content[:8000]
 
     try:
-        response = model.generate_content(
-            ANALYSIS_PROMPT.format(content=content),
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.1,
-                response_mime_type='application/json',
-            )
+        resp = requests.post(
+            'https://openrouter.ai/api/v1/chat/completions',
+            headers={
+                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                'Content-Type': 'application/json',
+            },
+            json={
+                'model': OPENROUTER_MODEL,
+                'messages': [{'role': 'user', 'content': ANALYSIS_PROMPT.format(content=content)}],
+                'response_format': {'type': 'json_object'},
+                'temperature': 0.1,
+            },
+            timeout=60,
         )
-        text = response.text.strip()
-        # 마크다운 코드블록 제거
+        resp.raise_for_status()
+        text = resp.json()['choices'][0]['message']['content'].strip()
         text = re.sub(r'^```(?:json)?\n?', '', text)
         text = re.sub(r'\n?```$', '', text)
         return json.loads(text)
     except Exception as e:
-        log.warning(f"Gemini 분석 실패: {e}")
+        log.warning(f"AI 분석 실패: {e}")
         return None
 
 
@@ -247,21 +457,27 @@ def save_structured(conn, article_id: int, data: dict):
         conn.commit()
 
 
-# ── 임베딩 ────────────────────────────────────────────────────
+# ── 임베딩 (HuggingFace) ─────────────────────────────────────
 
 def get_embedding(text: str) -> Optional[list[float]]:
-    if not GEMINI_API_KEY:
-        return None
-    try:
-        result = genai.embed_content(
-            model='models/text-embedding-004',
-            content=text,
-            task_type='retrieval_document',
-        )
-        return result['embedding']
-    except Exception as e:
-        log.warning(f"임베딩 실패: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            resp = requests.post(HF_EMBED_URL, json={'inputs': text}, timeout=30)
+            if resp.status_code == 503:
+                wait = min(resp.json().get('estimated_time', 20), 30)
+                log.info(f"HuggingFace 모델 로딩 중... {wait:.0f}초 대기")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            result = resp.json()
+            # [[float, ...]] 또는 [float, ...]
+            if isinstance(result, list) and isinstance(result[0], list):
+                return result[0]
+            return result
+        except Exception as e:
+            log.warning(f"임베딩 실패 (시도 {attempt+1}): {e}")
+            time.sleep(5)
+    return None
 
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
@@ -307,7 +523,7 @@ def run(source_keys: list[str] = None, max_pages: int = 50, analyze: bool = True
         source_keys = list(SOURCES.keys())
 
     conn = get_db()
-    model = setup_gemini() if analyze else None
+    model = setup_ai() if analyze else None
     existing_urls = get_existing_urls(conn)
 
     for source_key in source_keys:
@@ -338,7 +554,7 @@ def run(source_keys: list[str] = None, max_pages: int = 50, analyze: bool = True
             existing_urls.add(url)
 
             if model and article.get('raw_content'):
-                structured = analyze_with_gemini(model, article)
+                structured = analyze_with_ai(model, article)
                 if structured:
                     save_structured(conn, article_id, structured)
                     log.info(f"  → 구조화 데이터 저장")
