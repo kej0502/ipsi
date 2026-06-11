@@ -1,8 +1,18 @@
 import { neon } from '@neondatabase/serverless';
 
-const sql = neon(process.env.DATABASE_URL!);
+// Lazy initialization: avoid calling neon() at module load time during build
+let _client: ReturnType<typeof neon> | null = null;
 
-export { sql };
+function getClient() {
+  if (!_client) {
+    _client = neon(process.env.DATABASE_URL!);
+  }
+  return _client;
+}
+
+export function sql(strings: TemplateStringsArray, ...values: unknown[]) {
+  return getClient()(strings, ...values) as Promise<Record<string, unknown>[]>;
+}
 
 export interface Article {
   id: number;
