@@ -1,8 +1,4 @@
 /** @type {import('next').NextConfig} */
-const nextConfig = {
-  experimental: {
-    serverComponentsExternalPackages: ['@neondatabase/serverless'],
-  },
-};
+const nextConfig = {};
 
 export default nextConfig;
