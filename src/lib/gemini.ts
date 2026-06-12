@@ -1,5 +1,5 @@
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
-const OR_MODEL = 'google/gemini-2.0-flash-exp:free';
+const OR_MODEL = 'openai/gpt-oss-120b:free';
 const HF_EMBED_URL =
   'https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/paraphrase-multilingual-mpnet-base-v2';
 
