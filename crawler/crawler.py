@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ['DATABASE_URL']
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
-OPENROUTER_MODEL = 'google/gemini-2.0-flash-exp:free'
+OPENROUTER_MODEL = 'openai/gpt-oss-120b:free'
 HF_EMBED_URL = (
     'https://api-inference.huggingface.co/pipeline/feature-extraction/'
     'sentence-transformers/paraphrase-multilingual-mpnet-base-v2'
@@ -346,6 +346,7 @@ def parse_article(source_key: str, idx: int) -> Optional[dict]:
 
     return {
         'source': source_key,
+        'source_idx': idx,
         'title': title,
         'url': url,
         'published_at': published_at,
@@ -356,14 +357,16 @@ def parse_article(source_key: str, idx: int) -> Optional[dict]:
 def save_article(conn, article: dict) -> Optional[int]:
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO articles (source, title, url, published_at, raw_content)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (url) DO UPDATE SET
+            INSERT INTO articles (source, source_idx, title, url, published_at, raw_content)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (source, source_idx) DO UPDATE SET
                 title = EXCLUDED.title,
+                url = EXCLUDED.url,
                 raw_content = EXCLUDED.raw_content
             RETURNING id
         """, (
             article['source'],
+            article['source_idx'],
             article['title'],
             article['url'],
             article['published_at'],
@@ -421,7 +424,6 @@ def analyze_with_ai(enabled, article: dict) -> Optional[dict]:
             json={
                 'model': OPENROUTER_MODEL,
                 'messages': [{'role': 'user', 'content': ANALYSIS_PROMPT.format(content=content)}],
-                'response_format': {'type': 'json_object'},
                 'temperature': 0.1,
             },
             timeout=60,
@@ -512,10 +514,10 @@ def save_embeddings(conn, article_id: int, content: str):
 
 # ── 메인 파이프라인 ────────────────────────────────────────────
 
-def get_existing_urls(conn) -> set[str]:
+def get_existing_ids(conn) -> set[tuple]:
     with conn.cursor() as cur:
-        cur.execute("SELECT url FROM articles")
-        return {row[0] for row in cur.fetchall()}
+        cur.execute("SELECT source, source_idx FROM articles WHERE source_idx IS NOT NULL")
+        return {(row[0], row[1]) for row in cur.fetchall()}
 
 
 def run(source_keys: list[str] = None, max_pages: int = 50, analyze: bool = True):
@@ -524,7 +526,7 @@ def run(source_keys: list[str] = None, max_pages: int = 50, analyze: bool = True
 
     conn = get_db()
     model = setup_ai() if analyze else None
-    existing_urls = get_existing_urls(conn)
+    existing_ids = get_existing_ids(conn)
 
     for source_key in source_keys:
         label = SOURCES[source_key]['label']
@@ -535,10 +537,10 @@ def run(source_keys: list[str] = None, max_pages: int = 50, analyze: bool = True
 
         new_count = 0
         for idx in sorted(all_ids, reverse=True):
-            url = SOURCES[source_key]['view_url'].format(idx=idx)
-            if url in existing_urls:
+            if (source_key, idx) in existing_ids:
                 continue
 
+            url = SOURCES[source_key]['view_url'].format(idx=idx)
             article = parse_article(source_key, idx)
             if not article:
                 log.warning(f"파싱 실패: {url}")
@@ -551,7 +553,7 @@ def run(source_keys: list[str] = None, max_pages: int = 50, analyze: bool = True
 
             log.info(f"[{label}] 저장: {article['title'][:50]}")
             new_count += 1
-            existing_urls.add(url)
+            existing_ids.add((source_key, idx))
 
             if model and article.get('raw_content'):
                 structured = analyze_with_ai(model, article)
@@ -570,6 +572,39 @@ def run(source_keys: list[str] = None, max_pages: int = 50, analyze: bool = True
     log.info("크롤링 완료")
 
 
+def fill_missing_analysis():
+    """structured_data/임베딩이 없는 기존 기사를 소급 분석."""
+    model = setup_ai()
+    if not model:
+        log.error("OPENROUTER_API_KEY 필요")
+        return
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT a.id, a.title, a.raw_content
+            FROM articles a
+            LEFT JOIN structured_data s ON s.article_id = a.id
+            WHERE s.id IS NULL AND a.raw_content IS NOT NULL AND a.raw_content != ''
+            ORDER BY a.id DESC
+        """)
+        articles = cur.fetchall()
+
+    log.info(f"소급 처리 대상: {len(articles)}개 기사")
+    for i, (article_id, title, raw_content) in enumerate(articles, 1):
+        log.info(f"[{i}/{len(articles)}] {title[:50]}")
+
+        structured = analyze_with_ai(model, {'title': title, 'raw_content': raw_content})
+        if structured:
+            save_structured(conn, article_id, structured)
+            log.info(f"  → 구조화 데이터 저장")
+
+        time.sleep(0.5)
+
+    conn.close()
+    log.info("소급 처리 완료")
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
@@ -577,10 +612,15 @@ if __name__ == '__main__':
                         help='수집할 소스 (기본: 전체)')
     parser.add_argument('--max-pages', type=int, default=50)
     parser.add_argument('--no-analyze', action='store_true', help='AI 분석 건너뜀')
+    parser.add_argument('--fill-missing', action='store_true',
+                        help='기존 기사 중 분석 누락된 것 소급 처리')
     args = parser.parse_args()
 
-    run(
-        source_keys=args.sources,
-        max_pages=args.max_pages,
-        analyze=not args.no_analyze,
-    )
+    if args.fill_missing:
+        fill_missing_analysis()
+    else:
+        run(
+            source_keys=args.sources,
+            max_pages=args.max_pages,
+            analyze=not args.no_analyze,
+        )
