@@ -45,7 +45,7 @@ HEADERS = {
     'Referer': 'https://www.megastudy.net/',
 }
 
-ATTACH_EXTS = {'.pdf', '.hwp', '.hwpx', '.xlsx', '.xls', '.docx', '.doc'}
+ATTACH_EXTS = {'.pdf', '.hwp', '.hwpx', '.xlsx', '.xls', '.docx', '.doc', '.zip'}
 
 SOURCES = {
     'news': {
@@ -218,10 +218,33 @@ def _extract_docx(data: bytes) -> str:
     return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
 
 
+def _extract_zip(data: bytes) -> str:
+    """ZIP 안의 문서 파일 텍스트 추출."""
+    texts: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for name in zf.namelist():
+                ext = os.path.splitext(name.lower())[1]
+                if ext not in {'.pdf', '.hwp', '.hwpx', '.xlsx', '.xls', '.docx'}:
+                    continue
+                try:
+                    inner = zf.read(name)
+                    text = extract_attachment_text(inner, name)
+                    if text.strip():
+                        texts.append(f'[{os.path.basename(name)}]\n{text[:4000]}')
+                except Exception as e:
+                    log.warning(f"ZIP 내부 파일 파싱 실패 ({name}): {e}")
+    except Exception as e:
+        log.warning(f"ZIP 파싱 실패: {e}")
+    return '\n\n'.join(texts)
+
+
 def extract_attachment_text(data: bytes, filename: str) -> str:
     ext = os.path.splitext(filename.lower())[1]
     try:
-        if ext == '.pdf':
+        if ext == '.zip':
+            return _extract_zip(data)
+        elif ext == '.pdf':
             return _extract_pdf(data)
         elif ext == '.hwp':
             return _extract_hwp(data)
@@ -640,35 +663,47 @@ def run(source_keys: list[str] = None, max_pages: int = 50, analyze: bool = True
 
 
 def fill_missing_analysis():
-    """structured_data/임베딩이 없는 기존 기사를 소급 분석."""
+    """structured_data가 없는 기존 기사를 소급 분석."""
     model = setup_ai()
     if not model:
         log.error("OPENROUTER_API_KEY 필요")
         return
 
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT a.id, a.title, a.raw_content
-            FROM articles a
-            LEFT JOIN structured_data s ON s.article_id = a.id
-            WHERE s.id IS NULL AND a.raw_content IS NOT NULL AND a.raw_content != ''
-            ORDER BY a.id DESC
-        """)
-        articles = cur.fetchall()
+    def fetch_pending():
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT a.id, a.title, a.raw_content
+                FROM articles a
+                LEFT JOIN structured_data s ON s.article_id = a.id
+                WHERE s.id IS NULL AND a.raw_content IS NOT NULL AND a.raw_content != ''
+                ORDER BY a.id DESC
+            """)
+            rows = cur.fetchall()
+        conn.close()
+        return rows
 
-    log.info(f"소급 처리 대상: {len(articles)}개 기사")
-    for i, (article_id, title, raw_content) in enumerate(articles, 1):
-        log.info(f"[{i}/{len(articles)}] {title[:50]}")
+    articles = fetch_pending()
+    total = len(articles)
+    log.info(f"소급 처리 대상: {total}개 기사")
+
+    done = 0
+    for article_id, title, raw_content in articles:
+        done += 1
+        log.info(f"[{done}/{total}] {title[:50]}")
 
         structured = analyze_with_ai(model, {'title': title, 'raw_content': raw_content})
         if structured:
-            save_structured(conn, article_id, structured)
-            log.info(f"  → 구조화 데이터 저장")
+            try:
+                conn = get_db()
+                save_structured(conn, article_id, structured)
+                conn.close()
+                log.info(f"  → 구조화 데이터 저장")
+            except Exception as e:
+                log.warning(f"  저장 실패: {e}")
 
         time.sleep(0.5)
 
-    conn.close()
     log.info("소급 처리 완료")
 
 
