@@ -406,6 +406,35 @@ ANALYSIS_PROMPT = """아래는 한국 대학입시 관련 기사/자료입니다
 {content}
 ---"""
 
+ARCHIVE_PROMPT = """아래는 한국 교육기관이 발표한 공식 자료입니다(수능, 모의고사, 학력평가 등). 다음 항목을 JSON으로 추출해주세요.
+
+규칙:
+- 없는 정보는 null 또는 빈 배열로
+- year: 시험 시행 연도 숫자 (예: 2024)
+- exam_type: 시험 종류 문자열 (예: "수능", "전국연합학력평가", "모의고사", "대학별고사", "기타")
+- applicant_count: 총 응시 인원 숫자 (없으면 null)
+- universities: 언급된 대학교 목록
+- admission_types: 관련 전형 목록
+- summary: 3줄 이내 핵심 요약
+- key_changes: 전년 대비 주요 변경사항 (없으면 null)
+- exam_stats: 시험 세부 데이터 — 다음 형태로 최대한 추출:
+  {{
+    "subjects": {{
+      "국어": {{"응시": 숫자, "평균": 숫자, "표준편차": 숫자, "등급컷": {{1: 점수, 2: 점수, ...}}}},
+      "수학": {{...}},
+      "영어": {{...}}
+    }},
+    "grade_distribution": {{"1등급": 숫자, "2등급": 숫자, ...}},
+    "notes": "기타 주요 통계"
+  }}
+
+반드시 유효한 JSON만 출력하세요. 마크다운 코드블록 없이 순수 JSON.
+
+자료:
+---
+{content}
+---"""
+
 
 def analyze_with_ai(enabled, article: dict) -> Optional[dict]:
     if not enabled or not OPENROUTER_API_KEY:
@@ -443,8 +472,9 @@ def save_structured(conn, article_id: int, data: dict):
         cur.execute("""
             INSERT INTO structured_data
               (article_id, universities, year, admission_types,
-               cutoff_scores, competition_rates, key_changes, summary)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               cutoff_scores, competition_rates, key_changes, summary,
+               exam_type, applicant_count, exam_stats)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING
         """, (
             article_id,
@@ -455,6 +485,43 @@ def save_structured(conn, article_id: int, data: dict):
             Json(data.get('competition_rates') or {}),
             data.get('key_changes'),
             data.get('summary'),
+            data.get('exam_type'),
+            data.get('applicant_count'),
+            Json(data.get('exam_stats') or {}),
+        ))
+        conn.commit()
+
+
+def save_structured_archive(conn, article_id: int, data: dict):
+    """archive 전용 — 기존 레코드 UPDATE 또는 INSERT."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO structured_data
+              (article_id, universities, year, admission_types,
+               cutoff_scores, competition_rates, key_changes, summary,
+               exam_type, applicant_count, exam_stats)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (article_id) DO UPDATE SET
+               universities = EXCLUDED.universities,
+               year = EXCLUDED.year,
+               admission_types = EXCLUDED.admission_types,
+               key_changes = EXCLUDED.key_changes,
+               summary = EXCLUDED.summary,
+               exam_type = EXCLUDED.exam_type,
+               applicant_count = EXCLUDED.applicant_count,
+               exam_stats = EXCLUDED.exam_stats
+        """, (
+            article_id,
+            data.get('universities') or [],
+            data.get('year'),
+            data.get('admission_types') or [],
+            Json(data.get('cutoff_scores') or {}),
+            Json(data.get('competition_rates') or {}),
+            data.get('key_changes'),
+            data.get('summary'),
+            data.get('exam_type'),
+            data.get('applicant_count'),
+            Json(data.get('exam_stats') or {}),
         ))
         conn.commit()
 
@@ -605,6 +672,53 @@ def fill_missing_analysis():
     log.info("소급 처리 완료")
 
 
+def refill_archive_analysis():
+    """교육기관발표자료를 전용 프롬프트로 재분석 (exam_type, applicant_count, exam_stats 추출)."""
+    model = setup_ai()
+    if not model:
+        log.error("OPENROUTER_API_KEY 필요")
+        return
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT a.id, a.title, a.raw_content
+            FROM articles a
+            WHERE a.source = 'archive' AND a.raw_content IS NOT NULL AND a.raw_content != ''
+            ORDER BY a.id DESC
+        """)
+        articles = cur.fetchall()
+
+    log.info(f"교육기관발표자료 재분석 대상: {len(articles)}개")
+    for i, (article_id, title, raw_content) in enumerate(articles, 1):
+        log.info(f"[{i}/{len(articles)}] {title[:50]}")
+        content = f"제목: {title}\n\n{raw_content}"[:8000]
+        try:
+            resp = requests.post(
+                'https://openrouter.ai/api/v1/chat/completions',
+                headers={'Authorization': f'Bearer {OPENROUTER_API_KEY}', 'Content-Type': 'application/json'},
+                json={
+                    'model': OPENROUTER_MODEL,
+                    'messages': [{'role': 'user', 'content': ARCHIVE_PROMPT.format(content=content)}],
+                    'temperature': 0.1,
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            text = resp.json()['choices'][0]['message']['content'].strip()
+            text = re.sub(r'^```(?:json)?\n?', '', text)
+            text = re.sub(r'\n?```$', '', text)
+            data = json.loads(text)
+            save_structured_archive(conn, article_id, data)
+            log.info(f"  → 저장 완료 (exam_type={data.get('exam_type')}, applicant={data.get('applicant_count')})")
+        except Exception as e:
+            log.warning(f"  재분석 실패: {e}")
+        time.sleep(0.5)
+
+    conn.close()
+    log.info("교육기관발표자료 재분석 완료")
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
@@ -614,10 +728,14 @@ if __name__ == '__main__':
     parser.add_argument('--no-analyze', action='store_true', help='AI 분석 건너뜀')
     parser.add_argument('--fill-missing', action='store_true',
                         help='기존 기사 중 분석 누락된 것 소급 처리')
+    parser.add_argument('--refill-archive', action='store_true',
+                        help='교육기관발표자료 전용 프롬프트로 재분석')
     args = parser.parse_args()
 
     if args.fill_missing:
         fill_missing_analysis()
+    elif args.refill_archive:
+        refill_archive_analysis()
     else:
         run(
             source_keys=args.sources,

@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
 import './globals.css';
 import Link from 'next/link';
-import { GraduationCap, Home, School, CalendarDays, BookOpen, Search } from 'lucide-react';
+import { GraduationCap, Home, School, CalendarDays, BookOpen, Search, FileText } from 'lucide-react';
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -16,6 +16,7 @@ const navItems = [
   { href: '/universities', label: '학교별', icon: School },
   { href: '/years', label: '연도별', icon: CalendarDays },
   { href: '/admission-types', label: '전형별', icon: BookOpen },
+  { href: '/archive', label: '발표자료', icon: FileText },
   { href: '/search', label: 'AI 검색', icon: Search },
 ];
 
