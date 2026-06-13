@@ -1,7 +1,7 @@
 export const dynamic = 'force-dynamic';
 
 import { sql } from '@/lib/db';
-import { ExternalLink, Users, FileText, ChevronDown } from 'lucide-react';
+import { ExternalLink, Users } from 'lucide-react';
 
 type ArchiveArticle = {
   id: number;
